@@ -1,12 +1,16 @@
 import json
+import os
 import re
+import subprocess
 import sys
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 
-import anthropic
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from .prompts import build_system_prompt
 from .history import (
@@ -16,9 +20,18 @@ from .history import (
 
 console = Console(stderr=True)
 
-MODEL = "claude-opus-4-6"
-MAX_TOKENS = 16000
-THINKING_BUDGET = 10000
+MODEL = "opus"
+
+STATUS_PHASES = [
+    (0, "Launching exploration..."),
+    (3, "Falling down the rabbit hole..."),
+    (8, "Searching for what most people miss..."),
+    (18, "Digging through primary sources..."),
+    (35, "Cross-referencing the evidence..."),
+    (55, "Crafting the narrative..."),
+    (90, "Going deep \u2014 this is a thorough one..."),
+    (150, "Still going... must have found something fascinating"),
+]
 
 
 @dataclass
@@ -38,56 +51,38 @@ class Exploration:
         return asdict(self)
 
 
-def _extract_sources(response) -> list[dict]:
+def _extract_sources(text: str) -> list[dict]:
+    """Extract markdown links as sources from the narrative."""
     sources = []
-    seen_urls = set()
-    for block in response.content:
-        if block.type == "web_search_tool_result":
-            for result in getattr(block, "search_results", []):
-                url = getattr(result, "url", "")
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    sources.append({
-                        "url": url,
-                        "title": getattr(result, "title", ""),
-                    })
+    seen = set()
+    for match in re.finditer(r'\[([^\]]+)\]\((https?://[^)]+)\)', text):
+        title, url = match.group(1), match.group(2)
+        if url not in seen:
+            seen.add(url)
+            sources.append({"url": url, "title": title})
     return sources
-
-
-def _extract_text(response) -> str:
-    parts = []
-    for block in response.content:
-        if block.type == "text":
-            parts.append(block.text)
-    return "\n".join(parts)
 
 
 def _parse_metadata(text: str) -> tuple[str, dict]:
     """Split narrative from trailing atlas-meta JSON block."""
-    # Look for ```atlas-meta ... ``` at the end
     pattern = r"```atlas-meta\s*\n(.+?)\n\s*```\s*$"
     match = re.search(pattern, text, re.DOTALL)
-
     if match:
         narrative = text[:match.start()].strip()
         try:
-            meta = json.loads(match.group(1))
-            return narrative, meta
+            return narrative, json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
 
-    # Fallback: look for any trailing JSON block
     pattern2 = r"```(?:json)?\s*\n(\{.+?\})\n\s*```\s*$"
     match2 = re.search(pattern2, text, re.DOTALL)
     if match2:
         narrative = text[:match2.start()].strip()
         try:
-            meta = json.loads(match2.group(1))
-            return narrative, meta
+            return narrative, json.loads(match2.group(1))
         except json.JSONDecodeError:
             pass
 
-    # Last resort: try to parse the entire text as JSON (legacy format)
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "narrative" in data:
@@ -95,7 +90,6 @@ def _parse_metadata(text: str) -> tuple[str, dict]:
     except json.JSONDecodeError:
         pass
 
-    # Total fallback
     return text, {
         "title": "Untitled Exploration",
         "tags": [],
@@ -104,32 +98,60 @@ def _parse_metadata(text: str) -> tuple[str, dict]:
     }
 
 
-def _check_api_key():
-    """Verify ANTHROPIC_API_KEY is set before making calls."""
-    import os
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        console.print(
-            "[bold red]Missing ANTHROPIC_API_KEY.[/bold red]\n"
-            "Set it with: [cyan]set ANTHROPIC_API_KEY=sk-ant-...[/cyan]\n"
-            "Get yours at: [link=https://console.anthropic.com/settings/keys]"
-            "console.anthropic.com/settings/keys[/link]"
-        )
+def _run_with_progress(cmd, user_message, env):
+    """Run claude CLI with animated progress phases and elapsed time."""
+    stop = threading.Event()
+    result = [None]
+    error = [None]
+
+    def run():
+        try:
+            result[0] = subprocess.run(
+                cmd, input=user_message,
+                capture_output=True, encoding="utf-8", errors="replace",
+                env=env, timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            error[0] = "Exploration timed out after 5 minutes."
+        except Exception as e:
+            error[0] = str(e)
+        finally:
+            stop.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+
+    with Progress(
+        SpinnerColumn("dots"),
+        TextColumn("[dim cyan]{task.description}[/dim cyan]"),
+        TextColumn("[dim]\u00b7[/dim]"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task(STATUS_PHASES[0][1], total=None)
+        thread.start()
+        start = time.time()
+        phase_idx = 0
+        while not stop.wait(0.3):
+            elapsed = time.time() - start
+            while (phase_idx < len(STATUS_PHASES) - 1
+                   and elapsed >= STATUS_PHASES[phase_idx + 1][0]):
+                phase_idx += 1
+            progress.update(task, description=STATUS_PHASES[phase_idx][1])
+
+    thread.join()
+
+    if error[0]:
+        console.print(f"[bold red]{error[0]}[/bold red]")
         sys.exit(1)
 
-
-STATUS_MESSAGES = {
-    "thinking": "[dim cyan]Thinking deeply...[/dim cyan]",
-    "searching": "[dim cyan]Searching {n}...[/dim cyan]",
-    "reading": "[dim cyan]Reading sources...[/dim cyan]",
-    "writing": "[dim cyan]Writing...[/dim cyan]",
-}
+    return result[0]
 
 
 def explore(mode: str, user_input: str | None = None,
-            angle: str | None = None) -> Exploration:
-    _check_api_key()
-
+            angle: str | None = None,
+            model: str = MODEL) -> tuple["Exploration", list[dict]]:
+    """Run an exploration. Returns (Exploration, history) for display."""
     history = load_history()
 
     system_prompt = build_system_prompt(
@@ -150,57 +172,45 @@ def explore(mode: str, user_input: str | None = None,
             msg += f"\nAngle: {angle}"
         user_message = msg
 
-    client = anthropic.Anthropic()
+    cmd = [
+        "claude", "-p",
+        "--model", model,
+        "--output-format", "json",
+        "--system-prompt", system_prompt,
+        "--allowedTools", "WebSearch,WebFetch",
+        "--no-session-persistence",
+    ]
 
-    # Stream the response for live progress feedback
-    with console.status(
-        "[bold cyan]Launching exploration...", spinner="dots"
-    ) as status:
-        search_count = 0
-        has_text = False
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
 
-        with client.messages.stream(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            thinking={"type": "adaptive"},
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-            tools=[
-                {
-                    "type": "web_search_20250305",
-                    "name": "web_search",
-                    "max_uses": 15,
-                },
-            ],
-        ) as stream:
-            for event in stream:
-                if event.type == "content_block_start":
-                    block = event.content_block
-                    block_type = getattr(block, "type", "")
-                    if block_type == "thinking":
-                        status.update(STATUS_MESSAGES["thinking"])
-                    elif block_type == "web_search_tool_use":
-                        search_count += 1
-                        status.update(
-                            STATUS_MESSAGES["searching"].format(n=search_count)
-                        )
-                    elif block_type == "web_search_tool_result":
-                        status.update(STATUS_MESSAGES["reading"])
-                    elif block_type == "text" and not has_text:
-                        has_text = True
-                        status.update(STATUS_MESSAGES["writing"])
+    result = _run_with_progress(cmd, user_message, env)
 
-            response = stream.get_final_message()
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        console.print(f"[bold red]Exploration failed.[/bold red]\n{stderr}")
+        sys.exit(1)
 
-    # Extract and parse
-    sources = _extract_sources(response)
-    raw_text = _extract_text(response)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        console.print("[bold red]Failed to parse response.[/bold red]")
+        console.print(result.stdout[:500])
+        sys.exit(1)
+
+    if data.get("is_error"):
+        console.print(
+            f"[bold red]Error:[/bold red] {data.get('result', 'unknown')}"
+        )
+        sys.exit(1)
+
+    raw_text = data.get("result", "")
     narrative, meta = _parse_metadata(raw_text)
+    sources = _extract_sources(narrative)
 
     exploration_id = uuid.uuid4().hex[:8]
     now = datetime.now(timezone.utc).isoformat()
 
-    # Merge connections from Claude + tag-based matching
     claude_connections = meta.get("connections", [])
     tag_connections = find_connections(meta.get("tags", []), history)
     all_connections = list(set(claude_connections + tag_connections))
@@ -219,4 +229,4 @@ def explore(mode: str, user_input: str | None = None,
     )
 
     save_exploration(exploration.to_dict())
-    return exploration
+    return exploration, history

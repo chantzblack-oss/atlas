@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "A personal exploration engine that makes discovery thrilling"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=0.86",
     "click>=8.0",
     "rich>=13.0",
+    "edge-tts>=6.1",
 ]
 
 [project.scripts]
