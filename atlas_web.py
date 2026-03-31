@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Atlas Web — Mobile-friendly web interface for Atlas explorations.
+Atlas Web -- Mobile-friendly web interface for Atlas explorations.
+
+Uses the Claude CLI (no API key needed -- uses your existing claude auth).
 
 HOW TO RUN:
-1. pip install flask anthropic
-2. Set your API key:
-     Windows:  $env:ANTHROPIC_API_KEY = "sk-ant-api03-YOUR-KEY"
-     Mac/Linux: export ANTHROPIC_API_KEY="sk-ant-api03-YOUR-KEY"
-3. python atlas_web.py
-4. Open http://localhost:8080 in your browser
-5. For phone access on same wifi: use the IP address shown at startup
+1. pip install flask
+2. python atlas_web.py
+3. Open http://localhost:8080 in your browser
+4. For phone access on same wifi: use the IP address shown at startup
 """
 
 import json
 import os
 import random
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,15 +31,8 @@ except ImportError:
     print("\n  Install Flask first:  pip install flask\n")
     sys.exit(1)
 
-try:
-    import anthropic
-except ImportError:
-    print("\n  Install Anthropic first:  pip install anthropic\n")
-    sys.exit(1)
-
 # -- Config -------------------------------------------------------------------
-MODEL = "claude-opus-4-6"
-THINKING_BUDGET = 10000
+MODEL = "opus"
 HISTORY_FILE = Path.home() / ".atlas" / "history.json"
 APP_PASSWORD = os.environ.get("ATLAS_PASSWORD", "atlas")
 
@@ -111,28 +106,23 @@ Topic: "{user_input}"
 They know the basics. Give them the Kurzgesagt deep-dive -- take them past the surface to where the real story lives. Actual papers, live debates, specific researchers, original data. Go deeper than any Wikipedia article."""
 
 
-# -- API helpers --------------------------------------------------------------
-def clean_citations(text):
-    text = re.sub(r'<[^>]*cite[^>]*>', '', text)
-    text = re.sub(r'<[^>]*antml[^>]*>', '', text)
-    text = re.sub(r'</?[a-zA-Z][^>]*>', '', text)
-    return text
+# -- Claude CLI helpers -------------------------------------------------------
+def find_claude_cli():
+    """Find the claude CLI binary."""
+    path = shutil.which("claude")
+    if path:
+        return path
+    # Check common Windows locations
+    for candidate in [
+        Path.home() / "AppData" / "Local" / "Programs" / "claude" / "claude.exe",
+        Path.home() / ".claude" / "bin" / "claude.exe",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    return "claude"  # Hope it's on PATH
 
 
-def parse_meta(text):
-    """Extract atlas-meta JSON block from the end of the narrative."""
-    meta = {"title": "Untitled", "tags": [], "next_thread": "", "connections": []}
-    pattern = r'```atlas-meta\s*\n(.*?)\n\s*```'
-    match = re.search(pattern, text, re.DOTALL)
-    if match:
-        try:
-            meta = {**meta, **json.loads(match.group(1))}
-        except json.JSONDecodeError:
-            pass
-        narrative = text[:match.start()].strip()
-    else:
-        narrative = text.strip()
-    return narrative, meta
+CLAUDE_CLI = find_claude_cli()
 
 
 def build_prompt(mode, user_input=None, angle=None):
@@ -147,48 +137,110 @@ def build_prompt(mode, user_input=None, angle=None):
     return "\n".join(parts)
 
 
-def stream_explore(system_prompt, user_message):
-    """Generator yielding SSE events as Claude streams."""
-    client = anthropic.Anthropic()
-    full_text = ""
+def parse_meta(text):
+    """Extract atlas-meta JSON block from the end of the narrative."""
+    meta = {"title": "Untitled", "tags": [], "next_thread": "", "connections": []}
+    # Try atlas-meta block
+    pattern = r'```atlas-meta\s*\n(.*?)\n\s*```'
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        try:
+            meta = {**meta, **json.loads(match.group(1))}
+        except json.JSONDecodeError:
+            pass
+        narrative = text[:match.start()].strip()
+    else:
+        narrative = text.strip()
+    return narrative, meta
+
+
+def clean_text(text):
+    """Remove citation tags from Claude output."""
+    text = re.sub(r'<[^>]*cite[^>]*>', '', text)
+    text = re.sub(r'<[^>]*antml[^>]*>', '', text)
+    text = re.sub(r'</?[a-zA-Z][^>]*>', '', text)
+    return text
+
+
+def run_claude(system_prompt, user_message, mode="surprise"):
+    """Run Claude CLI and yield SSE events. No API key needed."""
+    cmd = [
+        CLAUDE_CLI, "-p",
+        "--model", MODEL,
+        "--output-format", "json",
+        "--system-prompt", system_prompt,
+        "--allowedTools", "WebSearch,WebFetch",
+        "--no-session-persistence",
+    ]
+
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+
+    # Yield initial status
+    yield f"data: {json.dumps({'type': 'status', 'message': 'Launching exploration...'})}\n\n"
+
     try:
-        with client.messages.stream(
-            model=MODEL,
-            max_tokens=16000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-            thinking={"type": "enabled", "budget_tokens": THINKING_BUDGET},
-            temperature=1,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        ) as stream:
-            for event in stream:
-                if hasattr(event, 'type') and event.type == 'content_block_delta':
-                    if hasattr(event.delta, 'text'):
-                        chunk = event.delta.text
-                        full_text += chunk
-                        yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
-
-        full_text = clean_citations(full_text)
-        narrative, meta = parse_meta(full_text)
-
-        # Save to Atlas history
-        entry = {
-            "id": f"{random.randint(0x10000000, 0xFFFFFFFF):08x}",
-            "mode": session.get("current_mode", "surprise"),
-            "title": meta["title"],
-            "narrative": narrative,
-            "tags": meta["tags"],
-            "next_thread": meta["next_thread"],
-            "connections": meta["connections"],
-            "sources": [],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        save_history_entry(entry)
-
-        yield f"data: {json.dumps({'type': 'meta', 'meta': meta, 'narrative': narrative, 'id': entry['id']})}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        result = subprocess.run(
+            cmd, input=user_message,
+            capture_output=True, encoding="utf-8", errors="replace",
+            env=env, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        yield f"data: {json.dumps({'type': 'error', 'message': 'Exploration timed out after 5 minutes.'})}\n\n"
+        return
+    except FileNotFoundError:
+        yield f"data: {json.dumps({'type': 'error', 'message': 'Claude CLI not found. Make sure claude is installed and on your PATH.'})}\n\n"
+        return
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        return
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()[:500]
+        yield f"data: {json.dumps({'type': 'error', 'message': f'Claude CLI error: {stderr}'})}\n\n"
+        return
+
+    # Parse the JSON output
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        # Try to use raw output as text
+        data = {"result": result.stdout}
+
+    # Extract text from Claude CLI JSON response
+    raw_text = ""
+    if isinstance(data, dict):
+        raw_text = data.get("result", "") or data.get("text", "") or result.stdout
+    elif isinstance(data, list):
+        # Claude sometimes returns array of content blocks
+        for block in data:
+            if isinstance(block, dict) and block.get("type") == "text":
+                raw_text += block.get("text", "")
+    else:
+        raw_text = str(data)
+
+    raw_text = clean_text(raw_text)
+    narrative, meta = parse_meta(raw_text)
+
+    # Send the full narrative as text
+    yield f"data: {json.dumps({'type': 'text', 'content': narrative})}\n\n"
+
+    # Save to Atlas history
+    entry = {
+        "id": f"{random.randint(0x10000000, 0xFFFFFFFF):08x}",
+        "mode": mode,
+        "title": meta["title"],
+        "narrative": narrative,
+        "tags": meta["tags"],
+        "next_thread": meta["next_thread"],
+        "connections": meta["connections"],
+        "sources": [],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    save_history_entry(entry)
+
+    yield f"data: {json.dumps({'type': 'meta', 'meta': meta, 'narrative': narrative, 'id': entry['id']})}\n\n"
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
 # -- History helpers ----------------------------------------------------------
@@ -216,8 +268,6 @@ def api_explore():
     user_input = data.get("input", "").strip()
     angle = data.get("angle", "").strip() or None
 
-    session["current_mode"] = mode
-
     system = build_prompt(mode, user_input=user_input or None, angle=angle)
 
     if mode == "surprise":
@@ -232,7 +282,7 @@ def api_explore():
         user_msg = user_input or "Surprise me."
 
     return Response(
-        stream_with_context(stream_explore(system, user_msg)),
+        stream_with_context(run_claude(system, user_msg, mode=mode)),
         mimetype='text/event-stream',
         headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
     )
@@ -245,12 +295,11 @@ def api_next():
     if not thread:
         return jsonify({"ok": False, "error": "No thread provided"})
 
-    session["current_mode"] = "thread"
     system = build_prompt("thread", user_input=thread)
     user_msg = f"Pull this thread: {thread}"
 
     return Response(
-        stream_with_context(stream_explore(system, user_msg)),
+        stream_with_context(run_claude(system, user_msg, mode="thread")),
         mimetype='text/event-stream',
         headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
     )
@@ -259,7 +308,6 @@ def api_next():
 @app.route("/api/history", methods=["GET"])
 def api_history():
     history = load_history()
-    # Return summaries, not full narratives
     summaries = []
     for e in reversed(history[-50:]):
         summaries.append({
@@ -419,10 +467,6 @@ body{background:var(--bg);color:var(--fg);font-family:Georgia,'Times New Roman',
   border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite;margin-right:10px;vertical-align:middle;}
 @keyframes spin{to{transform:rotate(360deg);}}
 
-/* Streaming cursor */
-.cursor{display:inline-block;width:2px;height:1em;background:var(--accent);animation:blink 1s infinite;vertical-align:text-bottom;margin-left:2px;}
-@keyframes blink{0%,50%{opacity:1;}51%,100%{opacity:0;}}
-
 /* Scrollbar */
 ::-webkit-scrollbar{width:6px;}
 ::-webkit-scrollbar-track{background:transparent;}
@@ -539,7 +583,6 @@ function followThread(thread) {
   const output = document.getElementById('explore-output');
   output.innerHTML = '<div class="status"><span class="spinner"></span>Following the thread...</div>';
 
-  // Switch to explore view
   showViewDirect('explore');
   streamExplore('/api/next', { thread: thread }, output);
 }
@@ -555,11 +598,13 @@ function showViewDirect(name) {
 function streamExplore(url, body, output) {
   const phases = [
     [0, 'Launching exploration...'],
-    [3000, 'Falling down the rabbit hole...'],
-    [8000, 'Searching for what most people miss...'],
-    [18000, 'Digging through primary sources...'],
-    [35000, 'Cross-referencing the evidence...'],
-    [55000, 'Crafting the narrative...'],
+    [5000, 'Falling down the rabbit hole...'],
+    [15000, 'Searching for what most people miss...'],
+    [30000, 'Digging through primary sources...'],
+    [60000, 'Cross-referencing the evidence...'],
+    [90000, 'Crafting the narrative...'],
+    [120000, 'Going deep -- this is a thorough one...'],
+    [180000, 'Still going... must have found something fascinating'],
   ];
   let phaseIdx = 0;
   const startTime = Date.now();
@@ -569,9 +614,6 @@ function streamExplore(url, body, output) {
     const statusEl = output.querySelector('.status');
     if (statusEl) statusEl.innerHTML = '<span class="spinner"></span>' + phases[phaseIdx][1];
   }, 1000);
-
-  let fullText = '';
-  let started = false;
 
   fetch(url, {
     method: 'POST',
@@ -595,23 +637,24 @@ function streamExplore(url, body, output) {
           try {
             const data = JSON.parse(line.slice(6));
 
+            if (data.type === 'status') {
+              const statusEl = output.querySelector('.status');
+              if (statusEl) statusEl.innerHTML = '<span class="spinner"></span>' + data.message;
+            }
+
             if (data.type === 'text') {
-              if (!started) {
-                started = true;
-                output.innerHTML = '<div class="narrative"></div>';
-              }
-              fullText += data.content;
-              renderMarkdown(output.querySelector('.narrative'), fullText);
+              clearInterval(phaseTimer);
+              output.innerHTML = '<div class="exploration"><div class="narrative"></div></div>';
+              renderMarkdown(output.querySelector('.narrative'), data.content);
             }
 
             if (data.type === 'meta') {
-              clearInterval(phaseTimer);
-              renderFinal(output, data.meta, data.narrative, data.id);
+              renderFinal(output.querySelector('.exploration') || output, data.meta, data.narrative, data.id);
             }
 
             if (data.type === 'error') {
               clearInterval(phaseTimer);
-              output.innerHTML = '<div class="status" style="color:#c44;">' + data.message + '</div>';
+              output.innerHTML = '<div class="status" style="color:#c44;">' + escHtml(data.message) + '</div>';
               reset();
             }
 
@@ -627,15 +670,14 @@ function streamExplore(url, body, output) {
     read();
   }).catch(err => {
     clearInterval(phaseTimer);
-    output.innerHTML = '<div class="status" style="color:#c44;">' + err.message + '</div>';
+    output.innerHTML = '<div class="status" style="color:#c44;">' + escHtml(err.message) + '</div>';
     reset();
   });
 }
 
 function renderMarkdown(el, text) {
-  // Basic markdown rendering
   let html = text
-    .replace(/```atlas-meta[\s\S]*?```/g, '')  // strip meta block
+    .replace(/```atlas-meta[\s\S]*?```/g, '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/^### (.+)$/gm, '<h3>$1</h3>')
     .replace(/^## (.+)$/gm, '<h2>$1</h2>')
@@ -647,40 +689,21 @@ function renderMarkdown(el, text) {
     .replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>')
     .replace(/\n\n/g, '</p><p>')
     .replace(/\n/g, '<br>');
-  html = '<p>' + html + '</p>';
-  html += '<span class="cursor"></span>';
-  el.innerHTML = html;
-  // Auto-scroll
-  window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  el.innerHTML = '<p>' + html + '</p>';
 }
 
-function renderFinal(output, meta, narrative, id) {
-  // Re-render without cursor
-  const narEl = output.querySelector('.narrative');
-  if (narEl) {
-    let html = narrative
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-      .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-      .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.+?)\*/g, '<em>$1</em>')
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>')
-      .replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>')
-      .replace(/\n\n/g, '</p><p>')
-      .replace(/\n/g, '<br>');
-    narEl.innerHTML = '<p>' + html + '</p>';
-  }
+function renderFinal(container, meta, narrative, id) {
+  const narEl = container.querySelector('.narrative');
+  if (narEl) renderMarkdown(narEl, narrative);
 
-  // Add header above narrative
+  // Add header
   const header = document.createElement('div');
   header.className = 'exp-header';
   header.innerHTML = `
     <div class="exp-mode ${currentMode}">${currentMode.toUpperCase()}</div>
     <div class="exp-title">${escHtml(meta.title)}</div>
   `;
-  output.insertBefore(header, output.firstChild);
+  container.insertBefore(header, container.firstChild);
 
   // Thread card
   if (meta.next_thread) {
@@ -691,7 +714,7 @@ function renderFinal(output, meta, narrative, id) {
       <div class="thread-label">NEXT THREAD</div>
       <div class="thread-text">${escHtml(meta.next_thread)}</div>
     `;
-    output.appendChild(card);
+    container.appendChild(card);
   }
 
   // Tags
@@ -701,12 +724,12 @@ function renderFinal(output, meta, narrative, id) {
     meta.tags.forEach(t => {
       tagsDiv.innerHTML += `<span class="tag">#${escHtml(t)}</span>`;
     });
-    output.appendChild(tagsDiv);
+    container.appendChild(tagsDiv);
   }
 }
 
 function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function reset() {
@@ -759,26 +782,17 @@ async function revisit(id) {
     if (!data.ok) { output.innerHTML = '<div class="status">Not found</div>'; return; }
 
     currentMode = data.mode || 'surprise';
-    const narrative = data.narrative || '';
-    let html = narrative
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-      .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-      .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.+?)\*/g, '<em>$1</em>')
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>')
-      .replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>')
-      .replace(/\n\n/g, '</p><p>')
-      .replace(/\n/g, '<br>');
-
-    output.innerHTML = '<div class="exploration"><div class="narrative"><p>' + html + '</p></div></div>';
+    const container = document.createElement('div');
+    container.className = 'exploration';
+    container.innerHTML = '<div class="narrative"></div>';
+    output.innerHTML = '';
+    output.appendChild(container);
 
     const meta = { title: data.title, tags: data.tags || [], next_thread: data.next_thread || '' };
-    renderFinal(output.querySelector('.exploration') || output, meta, narrative, id);
+    renderMarkdown(container.querySelector('.narrative'), data.narrative || '');
+    renderFinal(container, meta, data.narrative || '', id);
   } catch(err) {
-    output.innerHTML = '<div class="status" style="color:#c44;">' + err.message + '</div>';
+    output.innerHTML = '<div class="status" style="color:#c44;">' + escHtml(err.message) + '</div>';
   }
 }
 
@@ -788,7 +802,6 @@ document.querySelectorAll('textarea').forEach(ta => {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 150) + 'px';
   });
-  // Submit on Enter (not Shift+Enter)
   ta.addEventListener('keydown', function(e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
