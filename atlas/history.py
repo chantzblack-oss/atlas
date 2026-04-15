@@ -1,5 +1,5 @@
 import json
-import tempfile
+from collections import Counter
 from pathlib import Path
 
 ATLAS_DIR = Path.home() / ".atlas"
@@ -46,6 +46,16 @@ def find_connections(new_tags: list[str], history: list[dict],
     return connections
 
 
+def _get_threads(entry: dict) -> list[str]:
+    """Get all threads from an entry, handling both old and new format."""
+    threads = entry.get("next_threads", [])
+    if not threads:
+        single = entry.get("next_thread", "")
+        if single:
+            threads = [single]
+    return threads
+
+
 def format_history_context(history: list[dict], max_recent: int = 20) -> str | None:
     if not history:
         return None
@@ -53,10 +63,14 @@ def format_history_context(history: list[dict], max_recent: int = 20) -> str | N
     lines = []
     for entry in recent:
         tags = ", ".join(entry.get("tags", []))
-        thread = entry.get("next_thread", "")
+        threads = _get_threads(entry)
+        thread_str = threads[0] if threads else ""
+        style = entry.get("style", "")
+        style_str = f" [{style}]" if style else ""
         lines.append(
-            f'[{entry["id"]}] "{entry["title"]}" ({entry["timestamp"][:10]}) '
-            f"-- Tags: {tags} -- Thread: {thread}"
+            f'[{entry["id"]}] "{entry["title"]}"{style_str} '
+            f'({entry["timestamp"][:10]}) '
+            f"-- Tags: {tags} -- Thread: {thread_str}"
         )
     return "\n".join(lines)
 
@@ -68,11 +82,13 @@ def get_recent_titles(history: list[dict], n: int = 10) -> list[str]:
 def get_all_threads(history: list[dict]) -> list[dict]:
     threads = []
     for entry in history:
-        if entry.get("next_thread"):
+        entry_threads = _get_threads(entry)
+        if entry_threads:
             threads.append({
                 "id": entry["id"],
                 "title": entry["title"],
-                "thread": entry["next_thread"],
+                "thread": entry_threads[0],
+                "threads": entry_threads,
                 "date": entry["timestamp"][:10],
                 "mode": entry["mode"],
             })
@@ -87,13 +103,14 @@ def search_history(query: str, history: list[dict]) -> list[dict]:
         title = entry.get("title", "").lower()
         narrative = entry.get("narrative", "").lower()
         tags = [t.lower() for t in entry.get("tags", [])]
-        thread = entry.get("next_thread", "").lower()
+        threads = _get_threads(entry)
+        threads_text = " ".join(t.lower() for t in threads)
 
         if query_lower in title:
             score += 3
         if any(query_lower in t for t in tags):
             score += 2
-        if query_lower in thread:
+        if query_lower in threads_text:
             score += 1
         if query_lower in narrative:
             score += 1
@@ -103,3 +120,121 @@ def search_history(query: str, history: list[dict]) -> list[dict]:
 
     results.sort(key=lambda x: x[0], reverse=True)
     return [entry for _, entry in results]
+
+
+# -- Journey awareness ---------------------------------------------------
+
+
+def analyze_themes(history: list[dict]) -> dict[str, int]:
+    """Count tag frequency across all history entries."""
+    counts = Counter()
+    for entry in history:
+        for tag in entry.get("tags", []):
+            counts[tag.lower()] += 1
+    return dict(counts.most_common())
+
+
+def find_thematic_clusters(history: list[dict],
+                           min_cluster: int = 2) -> list[dict]:
+    """Group explorations by overlapping tags into thematic clusters."""
+    if not history:
+        return []
+
+    # Build tag -> exploration mapping
+    tag_to_ids = {}
+    id_to_entry = {}
+    for entry in history:
+        eid = entry["id"]
+        id_to_entry[eid] = entry
+        for tag in entry.get("tags", []):
+            tag_lower = tag.lower()
+            tag_to_ids.setdefault(tag_lower, set()).add(eid)
+
+    # Find clusters: groups of tags that frequently co-occur
+    theme_counts = analyze_themes(history)
+    top_tags = [t for t, c in theme_counts.items() if c >= min_cluster]
+
+    clusters = []
+    seen_ids = set()
+
+    for tag in top_tags:
+        ids = tag_to_ids.get(tag, set())
+        # Only create cluster if it has explorations we haven't fully covered
+        new_ids = ids - seen_ids
+        if len(ids) >= min_cluster and new_ids:
+            # Find related tags (co-occurring)
+            related_tags = Counter()
+            for eid in ids:
+                for t in id_to_entry[eid].get("tags", []):
+                    t_lower = t.lower()
+                    if t_lower != tag:
+                        related_tags[t_lower] += 1
+
+            top_related = [t for t, c in related_tags.most_common(3) if c >= 2]
+            theme_name = " & ".join([tag] + top_related[:1]) if top_related else tag
+
+            clusters.append({
+                "theme": theme_name,
+                "primary_tag": tag,
+                "count": len(ids),
+                "exploration_ids": sorted(ids),
+                "related_tags": top_related,
+                "entries": [id_to_entry[eid] for eid in sorted(ids)],
+            })
+            seen_ids |= ids
+
+    clusters.sort(key=lambda c: c["count"], reverse=True)
+    return clusters
+
+
+def format_journey_context(history: list[dict]) -> str | None:
+    """Build a narrative context string summarizing thematic patterns."""
+    if len(history) < 3:
+        return None
+
+    themes = analyze_themes(history)
+    if not themes:
+        return None
+
+    # Top themes
+    top = list(themes.items())[:6]
+    if not top:
+        return None
+
+    lines = []
+
+    # Theme summary
+    theme_parts = [f"{tag} ({count})" for tag, count in top]
+    lines.append(f"Top themes across {len(history)} explorations: "
+                 + ", ".join(theme_parts))
+
+    # Recent trajectory (last 5)
+    recent = history[-5:]
+    recent_tags = Counter()
+    for entry in recent:
+        for tag in entry.get("tags", []):
+            recent_tags[tag.lower()] += 1
+    if recent_tags:
+        trending = [t for t, c in recent_tags.most_common(3)]
+        lines.append(f"Recent focus: {', '.join(trending)}")
+
+    # Clusters
+    clusters = find_thematic_clusters(history)
+    if clusters:
+        for cluster in clusters[:3]:
+            lines.append(
+                f"Cluster: \"{cluster['theme']}\" — "
+                f"{cluster['count']} explorations"
+            )
+
+    # Styles used
+    style_counts = Counter()
+    for entry in history:
+        s = entry.get("style")
+        if s:
+            style_counts[s] += 1
+    if style_counts:
+        fav = style_counts.most_common(1)[0]
+        lines.append(f"Preferred style: {fav[0]} (used {fav[1]} times)")
+
+    return "\n".join(lines)
