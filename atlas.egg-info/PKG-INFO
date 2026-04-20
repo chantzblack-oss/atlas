@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: atlas
-Version: 0.1.0
-Summary: A personal exploration engine that makes discovery thrilling
-Requires-Python: >=3.10
-Requires-Dist: anthropic>=0.86
-Requires-Dist: click>=8.0
-Requires-Dist: rich>=13.0
